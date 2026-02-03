@@ -17,13 +17,13 @@ import type {
   ErrorCode,
 } from './types';
 
-// 导入各处理模块（后续阶段实现）
-// import { CardParser } from './parser/card-parser';
-// import { RendererFetcher } from './renderer/renderer-fetcher';
-// import { HTMLGenerator } from './generator/html-generator';
-// import { ThemeProcessor } from './theme/theme-processor';
-// import { ResourceHandler } from './resource/resource-handler';
-// import { OutputWriter } from './output/output-writer';
+// 导入各处理模块
+import { CardParser } from './parser/card-parser';
+import { RendererFetcher } from './renderer/renderer-fetcher';
+import { HTMLGenerator } from './generator/html-generator';
+import { ThemeProcessor } from './theme/theme-processor';
+import { ResourceHandler } from './resource/resource-handler';
+import { OutputWriter } from './output/output-writer';
 
 /**
  * 插件元数据
@@ -71,6 +71,33 @@ export class CardtoHTMLPlugin implements ConverterPlugin {
   /** 活动任务映射 */
   private _activeTasks: Map<string, { cancelled: boolean }> = new Map();
 
+  /** 卡片解析器 */
+  private _parser: CardParser;
+
+  /** 渲染代码获取器 */
+  private _rendererFetcher: RendererFetcher;
+
+  /** HTML 生成器 */
+  private _htmlGenerator: HTMLGenerator;
+
+  /** 主题处理器 */
+  private _themeProcessor: ThemeProcessor;
+
+  /** 资源处理器 */
+  private _resourceHandler: ResourceHandler;
+
+  /** 输出写入器 */
+  private _outputWriter: OutputWriter;
+
+  constructor() {
+    this._parser = new CardParser();
+    this._rendererFetcher = new RendererFetcher();
+    this._htmlGenerator = new HTMLGenerator();
+    this._themeProcessor = new ThemeProcessor();
+    this._resourceHandler = new ResourceHandler();
+    this._outputWriter = new OutputWriter();
+  }
+
   /**
    * 执行转换
    *
@@ -117,8 +144,22 @@ export class CardtoHTMLPlugin implements ConverterPlugin {
         return this._createCancelledResult(taskId);
       }
 
-      // TODO: 调用 CardParser 解析卡片
-      // const cardData = await this._parser.parse(source);
+      const parseResult = await this._parser.parse(source);
+      if (!parseResult.success || !parseResult.data) {
+        return {
+          success: false,
+          taskId,
+          error: parseResult.error ?? {
+            code: 'CONV-HTML-002' as ErrorCode,
+            message: '卡片解析失败',
+          },
+          warnings: parseResult.warnings,
+        };
+      }
+      const cardData = parseResult.data;
+      if (parseResult.warnings) {
+        warnings.push(...parseResult.warnings);
+      }
       reportProgress('parsing', 20, '卡片解析完成');
 
       // 2. 获取渲染代码
@@ -128,8 +169,8 @@ export class CardtoHTMLPlugin implements ConverterPlugin {
         return this._createCancelledResult(taskId);
       }
 
-      // TODO: 调用 RendererFetcher 获取渲染代码
-      // const renderers = await this._rendererFetcher.fetchRenderers(cardTypes);
+      const cardTypes = [...new Set(cardData.baseCards.map(c => c.type))];
+      const renderers = await this._rendererFetcher.fetchRenderers(cardTypes);
       reportProgress('rendering', 40, '渲染代码获取完成');
 
       // 3. 生成 HTML
@@ -139,8 +180,22 @@ export class CardtoHTMLPlugin implements ConverterPlugin {
         return this._createCancelledResult(taskId);
       }
 
-      // TODO: 调用 HTMLGenerator 生成 HTML
-      // const htmlFiles = await this._htmlGenerator.generate(cardData, renderers);
+      const generateResult = await this._htmlGenerator.generate(cardData, renderers);
+      if (!generateResult.success || !generateResult.files) {
+        return {
+          success: false,
+          taskId,
+          error: {
+            code: 'CONV-HTML-007' as ErrorCode,
+            message: generateResult.error ?? 'HTML 生成失败',
+          },
+          warnings: generateResult.warnings,
+        };
+      }
+      let htmlFiles = generateResult.files;
+      if (generateResult.warnings) {
+        warnings.push(...generateResult.warnings);
+      }
       reportProgress('rendering', 60, 'HTML 生成完成');
 
       // 4. 处理主题
@@ -150,8 +205,21 @@ export class CardtoHTMLPlugin implements ConverterPlugin {
         return this._createCancelledResult(taskId);
       }
 
-      // TODO: 调用 ThemeProcessor 处理主题
-      // const { htmlFiles: themedHtml, themeCss } = await this._themeProcessor.process(...);
+      const themeId = mergedOptions.themeId ?? cardData.metadata.themeId;
+      const themeResult = await this._themeProcessor.process(themeId, htmlFiles);
+      if (!themeResult.success || !themeResult.htmlFiles || !themeResult.themeCss) {
+        return {
+          success: false,
+          taskId,
+          error: {
+            code: 'CONV-HTML-008' as ErrorCode,
+            message: themeResult.error ?? '主题处理失败',
+          },
+          warnings,
+        };
+      }
+      htmlFiles = themeResult.htmlFiles;
+      const themeCss = themeResult.themeCss;
       reportProgress('processing', 70, '主题处理完成');
 
       // 5. 处理资源
@@ -161,8 +229,26 @@ export class CardtoHTMLPlugin implements ConverterPlugin {
         return this._createCancelledResult(taskId);
       }
 
-      // TODO: 调用 ResourceHandler 处理资源
-      // const { htmlFiles: finalHtml, resources } = await this._resourceHandler.handle(...);
+      let resourceFiles = new Map<string, Uint8Array>();
+      if (mergedOptions.includeAssets !== false) {
+        this._resourceHandler = new ResourceHandler({
+          strategy: mergedOptions.assetStrategy,
+        });
+        const resourceResult = await this._resourceHandler.handle(
+          htmlFiles,
+          cardData.resources,
+          cardData.rawFiles
+        );
+        if (resourceResult.htmlFiles) {
+          htmlFiles = resourceResult.htmlFiles;
+        }
+        if (resourceResult.resourceFiles) {
+          resourceFiles = resourceResult.resourceFiles;
+        }
+        if (resourceResult.warnings) {
+          warnings.push(...resourceResult.warnings);
+        }
+      }
       reportProgress('processing', 90, '资源处理完成');
 
       // 6. 输出
@@ -172,24 +258,40 @@ export class CardtoHTMLPlugin implements ConverterPlugin {
         return this._createCancelledResult(taskId);
       }
 
-      // TODO: 调用 OutputWriter 输出结果
-      // const output = await this._outputWriter.write(...);
+      const writeResult = await this._outputWriter.write(
+        htmlFiles,
+        themeCss,
+        resourceFiles,
+        mergedOptions.outputPath
+      );
       reportProgress('completed', 100, '转换完成');
 
       const duration = Date.now() - startTime;
 
-      // 返回成功结果（临时占位）
+      if (!writeResult.success) {
+        return {
+          success: false,
+          taskId,
+          error: {
+            code: 'CONV-HTML-012' as ErrorCode,
+            message: writeResult.error ?? '写入失败',
+          },
+          warnings,
+        };
+      }
+
       return {
         success: true,
         taskId,
-        outputPath: mergedOptions.outputPath,
+        outputPath: writeResult.outputPath,
+        data: writeResult.data,
         warnings: warnings.length > 0 ? warnings : undefined,
         stats: {
           duration,
-          inputSize: 0, // TODO: 计算实际大小
-          outputSize: 0,
-          baseCardCount: 0,
-          resourceCount: 0,
+          inputSize: 0, // 需要从解析阶段获取
+          outputSize: writeResult.totalSize ?? 0,
+          baseCardCount: cardData.baseCards.length,
+          resourceCount: resourceFiles.size,
         },
       };
     } catch (error) {
