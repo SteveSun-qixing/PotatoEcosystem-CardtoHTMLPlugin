@@ -420,6 +420,7 @@ export class CardParser {
    */
   private _extractResourceReferences(rawConfig: Record<string, unknown>, cardId: string): ResourceReference[] {
     const resources: ResourceReference[] = [];
+    const resourceFields = ['image', 'video', 'audio', 'file', 'src', 'url', 'path', 'image_file', 'video_file', 'audio_file'];
 
     const extractFromValue = (value: unknown, parentKey: string): void => {
       if (typeof value === 'string' && this._isResourcePath(value)) {
@@ -564,7 +565,7 @@ export class CardParser {
    * @returns 解析后的对象
    */
   private _parseYAML(yamlString: string): Record<string, unknown> {
-    return dataSerializer.parseYAML(yamlString) as Record<string, unknown>;
+    return dataSerializer.parseYAML<Record<string, unknown>>(yamlString);
   }
 }
 
