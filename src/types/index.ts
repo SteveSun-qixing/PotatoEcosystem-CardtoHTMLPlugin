@@ -288,19 +288,29 @@ export interface ConversionError {
 
 /**
  * 转换源类型
+ * 
+ * - 'files': 文件夹结构（编辑器常用，直接传递文件映射）
+ * - 'data': 标准卡片文件（ZIP 格式，需要先解压）
+ * - 'path': 文件路径（需要外部先读取）
  */
-export type ConversionSourceType = 'path' | 'data';
+export type ConversionSourceType = 'files' | 'data' | 'path';
 
 /**
  * 转换源
+ * 
+ * 支持两种主要输入方式：
+ * 1. 文件夹结构（type: 'files'）- 编辑器直接传递已解压的文件映射
+ * 2. 标准卡片文件（type: 'data'）- ZIP 格式数据，转换模块会自动解压
  */
 export interface ConversionSource {
   /** 源类型 */
   type: ConversionSourceType;
   /** 文件路径（type 为 path 时） */
   path?: string;
-  /** 卡片数据（type 为 data 时） */
+  /** 卡片数据 - ZIP 格式（type 为 data 时） */
   data?: Uint8Array;
+  /** 文件映射 - 文件夹结构（type 为 files 时）*/
+  files?: Map<string, Uint8Array>;
   /** 文件类型 */
   fileType: 'card';
 }

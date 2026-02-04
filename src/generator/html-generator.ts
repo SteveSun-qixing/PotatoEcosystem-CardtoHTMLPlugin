@@ -147,16 +147,36 @@ export class HTMLGenerator {
    * @param baseCardIds - 基础卡片 ID 列表
    * @returns HTML 字符串
    */
-  private _generateIndexHTML(cardData: CardData, baseCardIds: string[]): string {
-    const { metadata, structure } = cardData;
-    const layoutType = structure.layout?.type ?? 'vertical';
+  private _generateIndexHTML(cardData: CardData, _baseCardIds: string[]): string {
+    const { metadata } = cardData;
+    const tags = (metadata.tags ?? []) as unknown[];
+    const createdAt = metadata.createdAt
+      ? new Date(metadata.createdAt).toLocaleString('zh-CN')
+      : '未知';
+    const exportAt = new Date().toLocaleString('zh-CN');
+    const baseCards = cardData.baseCards ?? [];
 
-    // 生成 iframe 列表
-    const iframes = baseCardIds.map(id => {
-      const baseCard = cardData.baseCards.find(c => c.id === id);
-      const title = baseCard?.name ?? id;
-      return `    <iframe class="card-frame" src="cards/${id}.html" title="${this._escapeHTML(title)}"></iframe>`;
-    }).join('\n');
+    const baseCardContent = baseCards.length > 0
+      ? baseCards.map((baseCard) => {
+        const typeLabel = this._getBaseCardTypeName(baseCard.type);
+        const contentHTML = this._renderBaseCardContent(baseCard);
+        return `
+        <div class="base-card">
+          <span class="base-card-type">${this._escapeHTML(typeLabel)}</span>
+          <div class="base-card-content">${contentHTML}</div>
+        </div>`;
+      }).join('')
+      : '<p class="empty-state">此卡片暂无内容</p>';
+
+    const tagHTML = tags.length > 0
+      ? `
+    <div class="tags">
+      ${tags.map((tag) => {
+        const label = Array.isArray(tag) ? tag.join('/') : String(tag ?? '');
+        return `<span class="tag">${this._escapeHTML(label)}</span>`;
+      }).join('')}
+    </div>`
+      : '';
 
     const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -164,71 +184,161 @@ export class HTMLGenerator {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="generator" content="Chips CardtoHTML Plugin">
-  <meta name="created-at" content="${metadata.createdAt}">
-  <meta name="modified-at" content="${metadata.modifiedAt}">
+  <meta name="created-at" content="${this._escapeHTML(metadata.createdAt)}">
+  <meta name="modified-at" content="${this._escapeHTML(metadata.modifiedAt)}">
   <title>${this._escapeHTML(metadata.name)}</title>
   <link rel="stylesheet" href="theme.css">
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      line-height: 1.8;
+      color: #333;
+      background: #f5f5f5;
+      padding: 40px;
     }
-    html, body {
-      width: 100%;
-      min-height: 100vh;
-      background: var(--page-bg, #f5f5f5);
-    }
-    .card-container {
-      max-width: var(--card-max-width, 800px);
+    .container {
+      max-width: 800px;
       margin: 0 auto;
-      padding: var(--card-padding, 24px);
-      display: flex;
-      flex-direction: ${layoutType === 'horizontal' ? 'row' : 'column'};
-      gap: var(--card-gap, 16px);
+      background: #fff;
+      border-radius: 16px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+      padding: 48px;
     }
-    .card-frame {
-      width: 100%;
-      border: none;
-      background: var(--card-bg, #fff);
-      border-radius: var(--card-radius, 8px);
-      box-shadow: var(--card-shadow, 0 2px 8px rgba(0,0,0,0.1));
-      min-height: 200px;
+    h1 {
+      color: #1a1a1a;
+      font-size: 32px;
+      font-weight: 700;
+      margin-bottom: 16px;
+      border-bottom: 3px solid #3b82f6;
+      padding-bottom: 16px;
     }
-    /* 响应式调整 */
-    @media (max-width: 768px) {
-      .card-container {
-        padding: 16px;
-        gap: 12px;
-      }
+    .meta {
+      color: #666;
+      font-size: 14px;
+      margin-bottom: 32px;
+      padding: 16px;
+      background: #f8fafc;
+      border-radius: 8px;
+    }
+    .meta p { margin: 6px 0; }
+    .meta strong { color: #333; }
+    .content { margin-top: 24px; }
+    .content h2 {
+      font-size: 20px;
+      color: #1a1a1a;
+      margin: 24px 0 16px;
+      padding-left: 12px;
+      border-left: 4px solid #3b82f6;
+    }
+    .base-card {
+      background: #fafafa;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 16px;
+      margin: 12px 0;
+    }
+    .base-card-type {
+      display: inline-block;
+      background: #e0f2fe;
+      color: #0369a1;
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 500;
+      margin-bottom: 8px;
+    }
+    .base-card-content {
+      color: #374151;
+      font-size: 15px;
+    }
+    .base-card-content img {
+      max-width: 100%;
+      height: auto;
+    }
+    .empty-state {
+      color: #999;
+      text-align: center;
+      padding: 40px 0;
+    }
+    .tags {
+      margin-top: 32px;
+      padding-top: 24px;
+      border-top: 1px solid #e5e7eb;
+    }
+    .tag {
+      display: inline-block;
+      background: #dbeafe;
+      color: #1d4ed8;
+      padding: 4px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      margin: 4px 4px 4px 0;
+    }
+    .footer {
+      margin-top: 40px;
+      padding-top: 24px;
+      border-top: 1px solid #e5e7eb;
+      color: #9ca3af;
+      font-size: 12px;
+      text-align: center;
     }
   </style>
 </head>
 <body>
-  <main class="card-container">
-${iframes}
-  </main>
-  <script>
-    // 自动调整 iframe 高度
-    (function() {
-      var frames = document.querySelectorAll('.card-frame');
-      frames.forEach(function(frame) {
-        frame.addEventListener('load', function() {
-          try {
-            var doc = frame.contentDocument || frame.contentWindow.document;
-            var height = doc.documentElement.scrollHeight || doc.body.scrollHeight;
-            frame.style.height = height + 'px';
-          } catch(e) {
-            // 跨域时无法获取高度
-          }
-        });
-      });
-    })();
-  </script>
+  <div class="container">
+    <h1>${this._escapeHTML(metadata.name)}</h1>
+    <div class="meta">
+      <p><strong>卡片 ID:</strong> ${this._escapeHTML(metadata.id)}</p>
+      <p><strong>创建时间:</strong> ${this._escapeHTML(createdAt)}</p>
+      <p><strong>导出时间:</strong> ${this._escapeHTML(exportAt)}</p>
+    </div>
+    <div class="content">
+      <h2>卡片内容</h2>
+      ${baseCardContent}
+    </div>
+    ${tagHTML}
+    <div class="footer">
+      由 Chips Editor 导出 · ${new Date().toLocaleDateString('zh-CN')}
+    </div>
+  </div>
 </body>
 </html>`;
 
     return this._options.minify ? this._minifyHTML(html) : html;
+  }
+
+  /**
+   * 获取基础卡片类型名称
+   */
+  private _getBaseCardTypeName(type: string): string {
+    const typeNames: Record<string, string> = {
+      'rich-text': '富文本',
+      'markdown': 'Markdown',
+      'image': '图片',
+      'video': '视频',
+      'audio': '音频',
+      'code': '代码',
+      'list': '列表',
+    };
+    return typeNames[type] || type;
+  }
+
+  /**
+   * 渲染基础卡片内容
+   */
+  private _renderBaseCardContent(baseCard: BaseCardConfig): string {
+    const config = baseCard.config ?? {};
+    const content = (config as Record<string, unknown>).content_text
+      ?? (config as Record<string, unknown>).content
+      ?? (config as Record<string, unknown>).text
+      ?? '';
+
+    if (typeof content === 'string' && content.trim().length > 0) {
+      return content;
+    }
+
+    return '<em style="color:#999">暂无内容</em>';
   }
 
   /**

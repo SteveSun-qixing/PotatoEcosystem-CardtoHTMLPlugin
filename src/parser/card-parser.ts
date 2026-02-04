@@ -2,8 +2,11 @@
  * CardParser - 卡片解析模块
  *
  * 负责解析 .card 文件，提取卡片元数据、结构信息、基础卡片配置和资源引用
+ * 
+ * 通过 Foundation 的 ZIPProcessor 解压卡片文件，使用 DataSerializer 解析 YAML 配置
  */
 
+import { zipProcessor, dataSerializer } from '@chips/foundation';
 import type {
   ConversionSource,
   CardData,
@@ -147,25 +150,35 @@ export class CardParser {
    *
    * @param source - 转换源
    * @returns 文件映射（路径 -> 内容）
+   * 
+   * @remarks
+   * 支持三种数据源：
+   * - type: 'files' + files: Map - 文件夹结构（编辑器常用），直接使用传入的文件映射
+   * - type: 'data' + data: Uint8Array - 标准卡片文件（ZIP），使用 Foundation.zipProcessor 解压
+   * - type: 'path' - 不直接支持，调用方需要先读取文件内容
    */
   private async _loadCardFiles(source: ConversionSource): Promise<Map<string, Uint8Array>> {
-    const files = new Map<string, Uint8Array>();
-
-    if (source.type === 'path' && source.path) {
-      // 从文件路径加载
-      // TODO: 调用 SDK 的 FileAPI 读取文件
-      // TODO: 调用 Foundation 的 ZIPProcessor 解压
-      // 临时实现：返回空映射，实际需要集成 SDK
-      throw new Error(`文件加载尚未实现: ${source.path}`);
+    if (source.type === 'files' && source.files) {
+      // 文件夹结构：直接使用传入的文件映射（编辑器常用方式）
+      return source.files;
     } else if (source.type === 'data' && source.data) {
-      // 从数据加载
-      // TODO: 调用 Foundation 的 ZIPProcessor 解压数据
-      throw new Error('数据加载尚未实现');
+      // 标准卡片文件（ZIP）：使用 Foundation 的 ZIPProcessor 解压
+      try {
+        const extractedFiles = await zipProcessor.extract(source.data);
+        return extractedFiles;
+      } catch (error) {
+        throw new Error(
+          `卡片文件解压失败: ${error instanceof Error ? error.message : '未知错误'}`
+        );
+      }
+    } else if (source.type === 'path' && source.path) {
+      // path 类型需要调用方先读取文件内容
+      throw new Error(
+        `不支持直接从路径加载，请先读取文件内容后使用 type: 'files' 或 'data' 方式传入。路径: ${source.path}`
+      );
     } else {
-      throw new Error('无效的转换源：必须提供 path 或 data');
+      throw new Error('无效的转换源：必须提供 files（文件夹结构）或 data（ZIP数据）');
     }
-
-    return files;
   }
 
   /**
@@ -192,30 +205,34 @@ export class CardParser {
     }
 
     try {
-      // TODO: 调用 Foundation 的 DataSerializer 解析 YAML
+      // 使用 Foundation 的 DataSerializer 解析 YAML
       const yamlString = new TextDecoder().decode(metadataContent);
       const rawMetadata = this._parseYAML(yamlString);
 
-      // 验证必需字段
-      if (!rawMetadata.id || !rawMetadata.name) {
+      // 验证必需字段（支持协议规范的 card_id 和向后兼容的 id）
+      const cardId = rawMetadata.card_id ?? rawMetadata.id;
+      if (!cardId || !rawMetadata.name) {
         return {
           success: false,
           error: {
             code: 'CONV-HTML-003' as ErrorCode,
-            message: 'metadata.yaml 缺少必需字段：id 或 name',
+            message: 'metadata.yaml 缺少必需字段：card_id（或 id）、name',
             filePath: metadataPath,
           },
         };
       }
 
+      // 支持协议规范的 theme_id 和向后兼容的 theme
+      const themeId = rawMetadata.theme_id ?? rawMetadata.theme;
+
       const metadata: CardMetadata = {
-        id: String(rawMetadata.id),
+        id: String(cardId),
         name: String(rawMetadata.name),
         version: String(rawMetadata.version ?? '1.0.0'),
         description: rawMetadata.description ? String(rawMetadata.description) : undefined,
         createdAt: String(rawMetadata.created_at ?? new Date().toISOString()),
         modifiedAt: String(rawMetadata.modified_at ?? new Date().toISOString()),
-        themeId: rawMetadata.theme ? String(rawMetadata.theme) : undefined,
+        themeId: themeId ? String(themeId) : undefined,
         tags: Array.isArray(rawMetadata.tags) ? rawMetadata.tags.map(String) : undefined,
         chipsStandardsVersion: String(rawMetadata.chips_standards_version ?? '1.0.0'),
       };
@@ -261,10 +278,11 @@ export class CardParser {
       const yamlString = new TextDecoder().decode(structureContent);
       const rawStructure = this._parseYAML(yamlString);
 
-      // 提取基础卡片 ID 列表
+      // 提取基础卡片 ID 列表（支持 'structure' 和 'base_cards' 字段名）
       let baseCardIds: string[] = [];
-      if (Array.isArray(rawStructure.base_cards)) {
-        baseCardIds = rawStructure.base_cards.map((card: unknown) => {
+      const cardList = rawStructure.structure ?? rawStructure.base_cards;
+      if (Array.isArray(cardList)) {
+        baseCardIds = cardList.map((card: unknown) => {
           if (typeof card === 'string') return card;
           if (typeof card === 'object' && card !== null && 'id' in card) {
             return String((card as { id: unknown }).id);
@@ -275,9 +293,9 @@ export class CardParser {
 
       const structure: CardStructure = {
         baseCardIds,
-        layout: rawStructure.layout ? {
-          type: String(rawStructure.layout.type ?? 'vertical'),
-          params: rawStructure.layout.params,
+        layout: rawStructure.layout && typeof rawStructure.layout === 'object' ? {
+          type: String((rawStructure.layout as any).type ?? 'vertical'),
+          params: (rawStructure.layout as any).params as Record<string, unknown> | undefined,
         } : undefined,
       };
 
@@ -312,11 +330,22 @@ export class CardParser {
     let lastError: ConversionError | undefined;
 
     for (const cardId of baseCardIds) {
-      const configPath = `content/${cardId}/config.yaml`;
-      const configContent = files.get(configPath);
+      // 支持两种文件结构：
+      // 1. content/{cardId}.yaml（单文件格式，编辑器使用）
+      // 2. content/{cardId}/config.yaml（文件夹格式，标准规范）
+      const singleFilePath = `content/${cardId}.yaml`;
+      const folderFilePath = `content/${cardId}/config.yaml`;
+      
+      let configContent = files.get(singleFilePath);
+      let configPath = singleFilePath;
+      
+      if (!configContent) {
+        configContent = files.get(folderFilePath);
+        configPath = folderFilePath;
+      }
 
       if (!configContent) {
-        const warning = `基础卡片配置文件不存在: ${configPath}`;
+        const warning = `基础卡片配置文件不存在: ${singleFilePath} 或 ${folderFilePath}`;
         warnings.push(warning);
         if (this._options.strict) {
           hasError = true;
@@ -334,11 +363,26 @@ export class CardParser {
         const yamlString = new TextDecoder().decode(configContent);
         const rawConfig = this._parseYAML(yamlString);
 
+        // 提取配置：支持三种格式
+        let config: Record<string, unknown>;
+        if (rawConfig.config && typeof rawConfig.config === 'object') {
+          // 格式1: 标准格式 - 有独立的 config 字段
+          config = rawConfig.config as Record<string, unknown>;
+        } else if (rawConfig.data && typeof rawConfig.data === 'object') {
+          // 格式2: data 字段格式 - 编辑器当前使用的格式
+          config = rawConfig.data as Record<string, unknown>;
+        } else {
+          // 格式3: 扁平格式 - 所有字段都在根层级
+          // 排除元字段（type, name, id, data等），其余都作为配置
+          const { type, card_type, name, id, data, ...rest } = rawConfig;
+          config = rest;
+        }
+
         const baseCard: BaseCardConfig = {
           id: cardId,
-          type: String(rawConfig.type ?? 'unknown'),
+          type: String(rawConfig.type ?? rawConfig.card_type ?? 'unknown'),
           name: rawConfig.name ? String(rawConfig.name) : undefined,
-          config: rawConfig.config ?? {},
+          config,
           resources: this._extractResourceReferences(rawConfig, cardId),
         };
 
@@ -370,13 +414,12 @@ export class CardParser {
   /**
    * 提取资源引用
    *
-   * @param config - 配置对象
+   * @param rawConfig - 原始配置对象（完整的YAML解析结果）
    * @param cardId - 卡片 ID
    * @returns 资源引用列表
    */
-  private _extractResourceReferences(config: Record<string, unknown>, cardId: string): ResourceReference[] {
+  private _extractResourceReferences(rawConfig: Record<string, unknown>, cardId: string): ResourceReference[] {
     const resources: ResourceReference[] = [];
-    const resourceFields = ['image', 'video', 'audio', 'file', 'src', 'url', 'path'];
 
     const extractFromValue = (value: unknown, parentKey: string): void => {
       if (typeof value === 'string' && this._isResourcePath(value)) {
@@ -395,16 +438,18 @@ export class CardParser {
       }
     };
 
-    resourceFields.forEach(field => {
-      if (field in config) {
-        extractFromValue(config[field], field);
+    // 递归遍历整个配置对象提取资源
+    const traverseConfig = (obj: Record<string, unknown>): void => {
+      for (const [key, value] of Object.entries(obj)) {
+        // 跳过元字段
+        if (['type', 'card_type', 'name', 'id'].includes(key)) {
+          continue;
+        }
+        extractFromValue(value, key);
       }
-    });
+    };
 
-    // 递归检查 config 字段
-    if (config.config && typeof config.config === 'object') {
-      Object.entries(config.config).forEach(([key, val]) => extractFromValue(val, key));
-    }
+    traverseConfig(rawConfig);
 
     return resources;
   }
@@ -511,89 +556,15 @@ export class CardParser {
   }
 
   /**
-   * 简易 YAML 解析器
-   * 注意：这是一个简化实现，生产环境应使用 js-yaml 或调用 Foundation 的 DataSerializer
+   * 解析 YAML 字符串
+   * 
+   * 使用 Foundation 的 DataSerializer 进行解析，支持完整的 YAML 语法
+   * 
+   * @param yamlString - YAML 格式的字符串
+   * @returns 解析后的对象
    */
   private _parseYAML(yamlString: string): Record<string, unknown> {
-    // TODO: 替换为调用 Foundation 的 DataSerializer
-    // 临时使用简易解析，只支持基本格式
-    const result: Record<string, unknown> = {};
-    const lines = yamlString.split('\n');
-    let currentKey = '';
-    let currentIndent = 0;
-    const stack: { obj: Record<string, unknown>; indent: number }[] = [{ obj: result, indent: -1 }];
-
-    for (const line of lines) {
-      // 跳过空行和注释
-      if (!line.trim() || line.trim().startsWith('#')) {
-        continue;
-      }
-
-      const indent = line.search(/\S/);
-      const content = line.trim();
-
-      // 检查是否是键值对
-      const colonIndex = content.indexOf(':');
-      if (colonIndex > 0) {
-        const key = content.substring(0, colonIndex).trim();
-        const value = content.substring(colonIndex + 1).trim();
-
-        // 调整栈
-        while (stack.length > 1 && stack[stack.length - 1]!.indent >= indent) {
-          stack.pop();
-        }
-
-        const currentObj = stack[stack.length - 1]!.obj;
-
-        if (value) {
-          // 有值
-          currentObj[key] = this._parseYAMLValue(value);
-        } else {
-          // 没有值，可能是对象或数组的开始
-          const newObj: Record<string, unknown> = {};
-          currentObj[key] = newObj;
-          stack.push({ obj: newObj, indent });
-        }
-        currentKey = key;
-        currentIndent = indent;
-      } else if (content.startsWith('- ')) {
-        // 数组元素
-        const value = content.substring(2).trim();
-        const currentObj = stack[stack.length - 1]!.obj;
-
-        // 找到正确的数组
-        if (!Array.isArray(currentObj[currentKey])) {
-          currentObj[currentKey] = [];
-        }
-        (currentObj[currentKey] as unknown[]).push(this._parseYAMLValue(value));
-      }
-    }
-
-    return result;
-  }
-
-  /**
-   * 解析 YAML 值
-   */
-  private _parseYAMLValue(value: string): unknown {
-    // 移除引号
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
-      return value.slice(1, -1);
-    }
-
-    // 布尔值
-    if (value === 'true') return true;
-    if (value === 'false') return false;
-
-    // null
-    if (value === 'null' || value === '~') return null;
-
-    // 数字
-    const num = Number(value);
-    if (!isNaN(num)) return num;
-
-    return value;
+    return dataSerializer.parseYAML(yamlString) as Record<string, unknown>;
   }
 }
 
