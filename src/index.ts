@@ -16,6 +16,11 @@ export { HTMLGenerator, createHTMLGenerator, htmlGenerator } from './generator';
 export { ThemeProcessor, createThemeProcessor, themeProcessor } from './theme';
 export { ResourceHandler, createResourceHandler, resourceHandler } from './resource';
 export { OutputWriter, createOutputWriter, outputWriter } from './output';
+export {
+  DEFAULT_CONVERSION_APPEARANCE_PROFILE_ID,
+  getConversionAppearanceProfiles,
+  resolveConversionAppearance,
+} from './appearance';
 
 // 导出模块类型
 export type { ParseResult, CardParserOptions } from './parser';
@@ -24,6 +29,14 @@ export type { HTMLGeneratorOptions, GenerateResult } from './generator';
 export type { ThemeDefinition, ThemeProcessResult } from './theme';
 export type { ResourceHandleResult, ResourceHandlerOptions } from './resource';
 export type { WriteResult } from './output';
+export type {
+  DeepPartial,
+  ConversionLayoutAppearance,
+  ConversionImageAppearance,
+  ConversionPDFAppearance,
+  ConversionAppearanceProfile,
+  ResolveAppearanceInput,
+} from './appearance';
 
 // 导出所有类型定义
 export type {

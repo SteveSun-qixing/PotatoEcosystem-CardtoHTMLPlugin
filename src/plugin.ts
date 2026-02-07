@@ -24,6 +24,7 @@ import { HTMLGenerator } from './generator/html-generator';
 import { ThemeProcessor } from './theme/theme-processor';
 import { ResourceHandler } from './resource/resource-handler';
 import { OutputWriter } from './output/output-writer';
+import { resolveConversionAppearance } from './appearance';
 
 /**
  * 插件元数据
@@ -180,7 +181,11 @@ export class CardtoHTMLPlugin implements ConverterPlugin {
         return this._createCancelledResult(taskId);
       }
 
-      const generateResult = await this._htmlGenerator.generate(cardData, renderers);
+      const appearance = resolveConversionAppearance({
+        profileId: mergedOptions.appearanceProfileId,
+        overrides: mergedOptions.appearanceOverrides,
+      });
+      const generateResult = await this._htmlGenerator.generate(cardData, renderers, appearance);
       if (!generateResult.success || !generateResult.files) {
         return {
           success: false,

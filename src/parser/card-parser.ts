@@ -106,10 +106,13 @@ export class CardParser {
       if (baseCardsResult.warnings) {
         warnings.push(...baseCardsResult.warnings);
       }
-      if (!baseCardsResult.success && this._options.strict) {
+      if (!baseCardsResult.success) {
         return {
           success: false,
-          error: baseCardsResult.error,
+          error: baseCardsResult.error ?? {
+            code: 'CONV-HTML-005' as ErrorCode,
+            message: '基础卡片配置解析失败',
+          },
           warnings,
         };
       }
@@ -278,17 +281,29 @@ export class CardParser {
       const yamlString = new TextDecoder().decode(structureContent);
       const rawStructure = this._parseYAML(yamlString);
 
-      // 提取基础卡片 ID 列表（支持 'structure' 和 'base_cards' 字段名）
+      // 提取基础卡片 ID 列表（仅支持标准 structure 字段）
       let baseCardIds: string[] = [];
-      const cardList = rawStructure.structure ?? rawStructure.base_cards;
+      const cardList = rawStructure.structure;
       if (Array.isArray(cardList)) {
-        baseCardIds = cardList.map((card: unknown) => {
-          if (typeof card === 'string') return card;
-          if (typeof card === 'object' && card !== null && 'id' in card) {
-            return String((card as { id: unknown }).id);
-          }
-          return '';
-        }).filter(Boolean);
+        const invalidIndex = cardList.findIndex(
+          (card) =>
+            typeof card !== 'object' ||
+            card === null ||
+            typeof (card as { id?: unknown }).id !== 'string' ||
+            !(card as { id: string }).id
+        );
+        if (invalidIndex >= 0) {
+          return {
+            success: false,
+            error: {
+              code: 'CONV-HTML-004' as ErrorCode,
+              message: `structure.yaml 结构无效: structure[${invalidIndex}] 缺少标准 id 字段`,
+              filePath: structurePath,
+            },
+          };
+        }
+
+        baseCardIds = cardList.map((card) => String((card as { id: unknown }).id));
       }
 
       const structure: CardStructure = {
@@ -330,76 +345,52 @@ export class CardParser {
     let lastError: ConversionError | undefined;
 
     for (const cardId of baseCardIds) {
-      // 支持两种文件结构：
-      // 1. content/{cardId}.yaml（单文件格式，编辑器使用）
-      // 2. content/{cardId}/config.yaml（文件夹格式，标准规范）
       const singleFilePath = `content/${cardId}.yaml`;
-      const folderFilePath = `content/${cardId}/config.yaml`;
-      
       let configContent = files.get(singleFilePath);
       let configPath = singleFilePath;
-      
-      if (!configContent) {
-        configContent = files.get(folderFilePath);
-        configPath = folderFilePath;
-      }
 
       if (!configContent) {
-        const warning = `基础卡片配置文件不存在: ${singleFilePath} 或 ${folderFilePath}`;
+        const warning = `基础卡片配置文件不存在: ${singleFilePath}`;
         warnings.push(warning);
-        if (this._options.strict) {
-          hasError = true;
-          lastError = {
-            code: 'CONV-HTML-005' as ErrorCode,
-            message: warning,
-            filePath: configPath,
-            cardId,
-          };
-        }
+        hasError = true;
+        lastError = {
+          code: 'CONV-HTML-005' as ErrorCode,
+          message: warning,
+          filePath: configPath,
+          cardId,
+        };
         continue;
       }
 
       try {
         const yamlString = new TextDecoder().decode(configContent);
         const rawConfig = this._parseYAML(yamlString);
-
-        // 提取配置：支持三种格式
-        let config: Record<string, unknown>;
-        if (rawConfig.config && typeof rawConfig.config === 'object') {
-          // 格式1: 标准格式 - 有独立的 config 字段
-          config = rawConfig.config as Record<string, unknown>;
-        } else if (rawConfig.data && typeof rawConfig.data === 'object') {
-          // 格式2: data 字段格式 - 编辑器当前使用的格式
-          config = rawConfig.data as Record<string, unknown>;
-        } else {
-          // 格式3: 扁平格式 - 所有字段都在根层级
-          // 排除元字段（type, name, id, data等），其余都作为配置
-          const { type, card_type, name, id, data, ...rest } = rawConfig;
-          config = rest;
+        const type = typeof rawConfig.type === 'string' ? rawConfig.type.trim() : '';
+        const config = rawConfig.data;
+        if (!type || typeof config !== 'object' || config === null || Array.isArray(config)) {
+          throw new Error('基础卡片内容必须为标准格式: { type: string, data: object }');
         }
 
         const baseCard: BaseCardConfig = {
           id: cardId,
-          type: String(rawConfig.type ?? rawConfig.card_type ?? 'unknown'),
+          type,
           name: rawConfig.name ? String(rawConfig.name) : undefined,
-          config,
-          resources: this._extractResourceReferences(rawConfig, cardId),
+          config: config as Record<string, unknown>,
+          resources: this._extractResourceReferences(config as Record<string, unknown>, cardId),
         };
 
         baseCards.push(baseCard);
       } catch (error) {
         const warning = `基础卡片配置解析失败 (${cardId}): ${error instanceof Error ? error.message : '未知错误'}`;
         warnings.push(warning);
-        if (this._options.strict) {
-          hasError = true;
-          lastError = {
-            code: 'CONV-HTML-005' as ErrorCode,
-            message: warning,
-            filePath: configPath,
-            cardId,
-            cause: error instanceof Error ? error : undefined,
-          };
-        }
+        hasError = true;
+        lastError = {
+          code: 'CONV-HTML-005' as ErrorCode,
+          message: warning,
+          filePath: configPath,
+          cardId,
+          cause: error instanceof Error ? error : undefined,
+        };
       }
     }
 
@@ -417,21 +408,49 @@ export class CardParser {
    * @param rawConfig - 原始配置对象（完整的YAML解析结果）
    * @param cardId - 卡片 ID
    * @returns 资源引用列表
+   *
+   * @remarks
+   * 使用两种策略提取资源引用：
+   * 1. 特定字段匹配：已知的资源路径字段名（file_path, image_file 等）
+   * 2. 通用路径检测：通过文件扩展名和 URL 模式识别资源路径
    */
   private _extractResourceReferences(rawConfig: Record<string, unknown>, cardId: string): ResourceReference[] {
     const resources: ResourceReference[] = [];
-    const resourceFields = ['image', 'video', 'audio', 'file', 'src', 'url', 'path', 'image_file', 'video_file', 'audio_file'];
+    const addedPaths = new Set<string>();
+
+    // 已知的资源路径字段名
+    const knownResourceFields = new Set([
+      'file_path', 'image_file', 'video_file', 'audio_file',
+      'src', 'url', 'path', 'image', 'video', 'audio', 'file',
+    ]);
+
+    const addResource = (value: string, parentKey: string): void => {
+      if (addedPaths.has(value)) return;
+      addedPaths.add(value);
+
+      const type = this._inferResourceType(value, parentKey);
+      resources.push({
+        id: `${cardId}-${resources.length}`,
+        type,
+        originalPath: value,
+        isInternal: !value.startsWith('/') && !value.startsWith('http'),
+        isNetwork: value.startsWith('http://') || value.startsWith('https://'),
+      });
+    };
 
     const extractFromValue = (value: unknown, parentKey: string): void => {
-      if (typeof value === 'string' && this._isResourcePath(value)) {
-        const type = this._inferResourceType(value, parentKey);
-        resources.push({
-          id: `${cardId}-${resources.length}`,
-          type,
-          originalPath: value,
-          isInternal: !value.startsWith('/') && !value.startsWith('http'),
-          isNetwork: value.startsWith('http://') || value.startsWith('https://'),
-        });
+      if (typeof value === 'string') {
+        // 策略1: 已知资源字段名 — 只要有值且不是明显的非路径值就提取
+        if (knownResourceFields.has(parentKey) && value.trim().length > 0) {
+          // 排除 blob URL（临时预览，不应出现在保存后的配置中，但做向后兼容）
+          if (!value.startsWith('blob:')) {
+            addResource(value, parentKey);
+          }
+        }
+        // 策略2: 通用路径检测（通过扩展名或URL模式）
+        else if (this._isResourcePath(value)) {
+          addResource(value, parentKey);
+        }
       } else if (Array.isArray(value)) {
         value.forEach((item, index) => extractFromValue(item, `${parentKey}[${index}]`));
       } else if (typeof value === 'object' && value !== null) {
@@ -565,7 +584,7 @@ export class CardParser {
    * @returns 解析后的对象
    */
   private _parseYAML(yamlString: string): Record<string, unknown> {
-    return dataSerializer.parseYAML<Record<string, unknown>>(yamlString);
+    return dataSerializer.parseYAML(yamlString) as Record<string, unknown>;
   }
 }
 

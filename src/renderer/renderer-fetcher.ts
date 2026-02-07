@@ -1,7 +1,19 @@
 /**
  * RendererFetcher - 渲染代码获取模块
  *
- * 负责从基础卡片插件获取各类型卡片的前端渲染代码
+ * 负责获取各类型基础卡片的前端渲染代码（HTML/CSS）。
+ *
+ * 架构设计：
+ * - 外部注册渲染器：通过 registerRenderer() 方法，PluginManager 或热安装的插件
+ *   可以在运行时动态注册新的渲染代码。
+ * - 内置后备渲染器：为常见基础卡片类型（RichTextCard、ImageCard 等）提供内置的
+ *   简易渲染器，在插件尚未注册时作为后备。
+ * - 占位渲染器：当以上两种方式都找不到时，返回占位页面。
+ *
+ * 查找优先级：外部注册 > 内置后备 > 占位渲染器
+ *
+ * 所有卡片类型名统一使用 PascalCase 格式（如 ImageCard、RichTextCard），
+ * 与卡片文件格式规范、插件清单（manifest.yaml）、编辑器 store 保持一致。
  */
 
 import type { RendererCode, RendererCodeMap } from '../types';
@@ -86,6 +98,12 @@ export class RendererFetcher {
   private _options: RendererFetcherOptions;
   private _cache: Map<string, CacheEntry> = new Map();
 
+  /** 外部注册的渲染器（来自 PluginManager 或热安装插件） */
+  private _externalRenderers: Map<string, RendererCode> = new Map();
+
+  /** 内置后备渲染器（PascalCase key，与卡片文件规范一致） */
+  private _builtinRenderers: Record<string, () => RendererCode>;
+
   /**
    * 创建渲染代码获取器实例
    *
@@ -93,6 +111,58 @@ export class RendererFetcher {
    */
   constructor(options?: RendererFetcherOptions) {
     this._options = { ...DEFAULT_OPTIONS, ...options };
+
+    // 内置后备渲染器使用惰性创建，避免构造时的开销
+    // key 统一使用 PascalCase，与卡片文件格式规范一致
+    this._builtinRenderers = {
+      'RichTextCard': () => this._createRichTextRenderer(),
+      'ImageCard': () => this._createImageRenderer(),
+      'VideoCard': () => this._createVideoRenderer(),
+      'AudioCard': () => this._createAudioRenderer(),
+      'CodeBlockCard': () => this._createCodeRenderer(),
+      'MarkdownCard': () => this._createMarkdownRenderer(),
+    };
+  }
+
+  /**
+   * 注册外部渲染器
+   *
+   * 允许 PluginManager 或热安装的插件在运行时动态注册渲染代码。
+   * 注册后的渲染器优先级高于内置后备渲染器。
+   *
+   * @param cardType - 卡片类型（PascalCase，如 'ImageCard'）
+   * @param code - 渲染代码
+   */
+  registerRenderer(cardType: string, code: RendererCode): void {
+    this._externalRenderers.set(cardType, code);
+    // 清除该类型的缓存，确保下次获取时使用新注册的渲染器
+    this.clearCache(cardType);
+  }
+
+  /**
+   * 注销外部渲染器
+   *
+   * 插件卸载时调用，移除该类型的外部渲染器注册。
+   *
+   * @param cardType - 卡片类型
+   */
+  unregisterRenderer(cardType: string): void {
+    this._externalRenderers.delete(cardType);
+    this.clearCache(cardType);
+  }
+
+  /**
+   * 获取所有已注册的渲染器类型（外部 + 内置）
+   */
+  getRegisteredTypes(): string[] {
+    const types = new Set<string>();
+    for (const type of this._externalRenderers.keys()) {
+      types.add(type);
+    }
+    for (const type of Object.keys(this._builtinRenderers)) {
+      types.add(type);
+    }
+    return Array.from(types);
   }
 
   /**
@@ -128,7 +198,7 @@ export class RendererFetcher {
       }
     }
 
-    // 尝试从插件系统获取
+    // 按优先级查找渲染器
     const renderer = await this._fetchFromPluginSystem(cardType);
 
     // 存入缓存
@@ -195,34 +265,38 @@ export class RendererFetcher {
   /**
    * 从插件系统获取渲染代码
    *
-   * @param cardType - 卡片类型
-   * @returns 渲染代码或占位渲染器
+   * 查找优先级：
+   * 1. 外部注册的渲染器（来自 PluginManager 或热安装插件）
+   * 2. 内置后备渲染器
+   * 3. 占位渲染器
+   *
+   * @param cardType - 卡片类型（PascalCase，如 'ImageCard'）
+   * @returns 渲染代码
    */
   private async _fetchFromPluginSystem(cardType: string): Promise<RendererCode> {
-    // TODO: 通过 SDK 的 PluginManager 获取插件的渲染代码
-    // 目前返回内置的渲染器或占位渲染器
-
-    // 内置基础类型的简易渲染器
-    const builtinRenderers: Record<string, RendererCode> = {
-      'rich-text': this._createRichTextRenderer(),
-      'image': this._createImageRenderer(),
-      'video': this._createVideoRenderer(),
-      'audio': this._createAudioRenderer(),
-      'code': this._createCodeRenderer(),
-      'markdown': this._createMarkdownRenderer(),
-    };
-
-    const builtin = builtinRenderers[cardType];
-    if (builtin) {
-      return builtin;
+    // 1. 外部注册的渲染器（优先级最高）
+    const external = this._externalRenderers.get(cardType);
+    if (external) {
+      return external;
     }
 
-    // 返回占位渲染器
+    // 2. 内置后备渲染器
+    const builtinFactory = this._builtinRenderers[cardType];
+    if (builtinFactory) {
+      return builtinFactory();
+    }
+
+    // 3. 占位渲染器
     return this.getPlaceholderRenderer(cardType);
   }
 
+  // ========== 内置后备渲染器 ==========
+  // 以下渲染器为常见基础卡片类型提供简易的静态 HTML 渲染，
+  // 在对应的基础卡片插件注册渲染代码之前作为后备使用。
+  // 未来插件通过 registerRenderer() 注册后，将自动覆盖这些内置版本。
+
   /**
-   * 创建富文本渲染器
+   * 创建富文本渲染器（RichTextCard）
    */
   private _createRichTextRenderer(): RendererCode {
     return {
@@ -261,7 +335,7 @@ export class RendererFetcher {
   <script>
     (function() {
       var config = window.CHIPS_CARD_CONFIG || {};
-      var content = config.content_text || config.content || '';
+      var content = config.content_text || config.content || config.text || '';
       document.getElementById('content').innerHTML = content;
     })();
   </script>
@@ -273,7 +347,7 @@ export class RendererFetcher {
   }
 
   /**
-   * 创建图片渲染器
+   * 创建图片渲染器（ImageCard）
    */
   private _createImageRenderer(): RendererCode {
     return {
@@ -289,43 +363,251 @@ export class RendererFetcher {
     body {
       margin: 0;
       padding: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100%;
       background: var(--bg-color, #f5f5f5);
+      color: var(--text-color, #333);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     }
-    .image-container {
-      max-width: 100%;
+    .image-card {
+      width: 100%;
+    }
+    .image-content {
+      width: 100%;
+    }
+    .image-empty {
+      padding: 28px 16px;
       text-align: center;
+      color: #999;
+      font-size: 14px;
     }
-    .image-container img {
+    .image-title {
+      padding: 12px 16px 4px;
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-color, #333);
+      word-break: break-word;
+    }
+    .image-caption {
+      padding: 4px 16px 12px;
+      font-size: 14px;
+      color: var(--text-secondary, #666);
+      word-break: break-word;
+    }
+
+    .layout-single {
+      display: flex;
+      width: 100%;
+    }
+    .layout-single img {
       max-width: 100%;
       height: auto;
       display: block;
+      border-radius: 4px;
     }
-    .image-caption {
-      padding: 8px 16px;
-      font-size: 14px;
-      color: var(--text-secondary, #666);
-      background: var(--bg-secondary, #f9f9f9);
+
+    .layout-grid {
+      display: grid;
+      width: 100%;
+    }
+    .layout-grid .grid-cell {
+      position: relative;
+      overflow: hidden;
+      aspect-ratio: 1;
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.04);
+    }
+    .layout-grid .grid-cell img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .layout-grid .grid-overflow {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 20px;
+      font-weight: 600;
+      background: rgba(0, 0, 0, 0.45);
+    }
+
+    .layout-long-scroll {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+    }
+    .layout-long-scroll img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .layout-horizontal-scroll {
+      display: flex;
+      overflow-x: auto;
+      overflow-y: hidden;
+      width: 100%;
+      -webkit-overflow-scrolling: touch;
+    }
+    .layout-horizontal-scroll img {
+      height: 220px;
+      width: auto;
+      flex-shrink: 0;
+      border-radius: 4px;
+      object-fit: cover;
     }
   </style>
 </head>
 <body>
-  <div class="image-container">
-    <img id="image" src="" alt="">
+  <div class="image-card">
+    <div class="image-content" id="image-container"></div>
+    <div class="image-title" id="title"></div>
     <div class="image-caption" id="caption"></div>
   </div>
   <script>
     (function() {
       var config = window.CHIPS_CARD_CONFIG || {};
-      var img = document.getElementById('image');
-      var caption = document.getElementById('caption');
-      img.src = config.src || config.url || '';
-      img.alt = config.alt || config.title || '';
-      caption.textContent = config.caption || config.description || '';
-      if (!caption.textContent) caption.style.display = 'none';
+      var container = document.getElementById('image-container');
+      var titleEl = document.getElementById('title');
+      var captionEl = document.getElementById('caption');
+
+      function toArray(value) {
+        return Array.isArray(value) ? value : [];
+      }
+
+      function resolveImageSrc(item) {
+        if (!item || typeof item !== 'object') return '';
+        if (item.source === 'url' && item.url) return String(item.url);
+        if (item.url) return String(item.url);
+        if (item.file_path) return String(item.file_path);
+        return '';
+      }
+
+      function createImageElement(item, className) {
+        var img = document.createElement('img');
+        img.src = resolveImageSrc(item);
+        img.alt = item && item.alt ? String(item.alt) : '';
+        img.title = item && item.title ? String(item.title) : '';
+        if (className) {
+          img.className = className;
+        }
+        return img;
+      }
+
+      function renderLegacySingle() {
+        var imageSrc = config.image_file || config.src || config.url || config.image || '';
+        if (!imageSrc) {
+          container.innerHTML = '<div class="image-empty">暂无图片</div>';
+          return;
+        }
+
+        var wrapper = document.createElement('div');
+        wrapper.className = 'layout-single';
+        wrapper.style.justifyContent = 'center';
+        var img = document.createElement('img');
+        img.src = String(imageSrc);
+        var fitMode = config.fit_mode || config.fitMode || 'contain';
+        if (fitMode && fitMode !== 'none') {
+          img.style.objectFit = String(fitMode);
+        }
+        wrapper.appendChild(img);
+        container.appendChild(wrapper);
+      }
+
+      var images = toArray(config.images).filter(function(item) {
+        return resolveImageSrc(item);
+      });
+
+      if (images.length === 0) {
+        renderLegacySingle();
+      } else {
+        var layoutType = images.length <= 1 ? 'single' : (config.layout_type || 'single');
+        var layoutOptions = config.layout_options || {};
+        var gap = Number(layoutOptions.gap);
+        if (!isFinite(gap)) gap = 8;
+
+        if (layoutType === 'single') {
+          var single = document.createElement('div');
+          single.className = 'layout-single';
+          var align = layoutOptions.single_alignment || 'center';
+          var justify = align === 'left' ? 'flex-start' : (align === 'right' ? 'flex-end' : 'center');
+          single.style.justifyContent = justify;
+          var widthPercent = Number(layoutOptions.single_width_percent);
+          if (!isFinite(widthPercent)) widthPercent = 100;
+          var singleImg = createImageElement(images[0], '');
+          singleImg.style.width = Math.max(10, Math.min(100, widthPercent)) + '%';
+          single.appendChild(singleImg);
+          container.appendChild(single);
+        } else if (layoutType === 'grid') {
+          var grid = document.createElement('div');
+          grid.className = 'layout-grid';
+          grid.style.gap = gap + 'px';
+          var gridMode = layoutOptions.grid_mode || '2x2';
+          var cols = gridMode === '2x2' ? 2 : 3;
+          grid.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
+          var limit = gridMode === '3-column-infinite' ? images.length : (gridMode === '3x3' ? 9 : 4);
+          var hasOverflow = images.length > limit && gridMode !== '3-column-infinite';
+          var displayCount = hasOverflow ? limit : Math.min(images.length, limit);
+
+          for (var i = 0; i < displayCount; i++) {
+            var cell = document.createElement('div');
+            cell.className = 'grid-cell';
+            var img = createImageElement(images[i], '');
+            cell.appendChild(img);
+            if (hasOverflow && i === displayCount - 1) {
+              var overlay = document.createElement('div');
+              overlay.className = 'grid-overflow';
+              overlay.textContent = '+' + String(images.length - limit + 1);
+              cell.appendChild(overlay);
+            }
+            grid.appendChild(cell);
+          }
+          container.appendChild(grid);
+        } else if (layoutType === 'long-scroll') {
+          var longScroll = document.createElement('div');
+          longScroll.className = 'layout-long-scroll';
+          longScroll.style.gap = gap + 'px';
+          var scrollMode = layoutOptions.scroll_mode || 'fixed-window';
+          if (scrollMode === 'fixed-window') {
+            var fixedHeight = Number(layoutOptions.fixed_window_height);
+            if (!isFinite(fixedHeight)) fixedHeight = 600;
+            longScroll.style.maxHeight = fixedHeight + 'px';
+            longScroll.style.overflowY = 'auto';
+          }
+          images.forEach(function(item) {
+            longScroll.appendChild(createImageElement(item, ''));
+          });
+          container.appendChild(longScroll);
+        } else if (layoutType === 'horizontal-scroll') {
+          var horizontal = document.createElement('div');
+          horizontal.className = 'layout-horizontal-scroll';
+          horizontal.style.gap = gap + 'px';
+          images.forEach(function(item) {
+            horizontal.appendChild(createImageElement(item, ''));
+          });
+          container.appendChild(horizontal);
+        } else {
+          renderLegacySingle();
+        }
+      }
+
+      var title = config.title || '';
+      if (!title && config.use_image_title_as_title === true && images[0] && images[0].title) {
+        title = images[0].title;
+      }
+      var caption = config.caption || config.description || '';
+      if (title) {
+        titleEl.textContent = String(title);
+      } else {
+        titleEl.style.display = 'none';
+      }
+      if (caption) {
+        captionEl.textContent = String(caption);
+      } else {
+        captionEl.style.display = 'none';
+      }
     })();
   </script>
 </body>
@@ -336,7 +618,7 @@ export class RendererFetcher {
   }
 
   /**
-   * 创建视频渲染器
+   * 创建视频渲染器（VideoCard）
    */
   private _createVideoRenderer(): RendererCode {
     return {
@@ -375,8 +657,10 @@ export class RendererFetcher {
     (function() {
       var config = window.CHIPS_CARD_CONFIG || {};
       var video = document.getElementById('video');
-      video.src = config.src || config.url || '';
-      if (config.poster) video.poster = config.poster;
+      // 兼容卡片文件格式规范字段名
+      video.src = config.video_file || config.src || config.url || '';
+      var poster = config.cover_image || config.poster || '';
+      if (poster) video.poster = poster;
       if (config.autoplay) video.autoplay = true;
       if (config.loop) video.loop = true;
       if (config.muted) video.muted = true;
@@ -390,7 +674,7 @@ export class RendererFetcher {
   }
 
   /**
-   * 创建音频渲染器
+   * 创建音频渲染器（AudioCard）
    */
   private _createAudioRenderer(): RendererCode {
     return {
@@ -436,7 +720,8 @@ export class RendererFetcher {
       var config = window.CHIPS_CARD_CONFIG || {};
       var audio = document.getElementById('audio');
       var title = document.getElementById('title');
-      audio.src = config.src || config.url || '';
+      // 兼容卡片文件格式规范字段名
+      audio.src = config.audio_file || config.src || config.url || '';
       title.textContent = config.title || config.name || '音频';
     })();
   </script>
@@ -448,7 +733,7 @@ export class RendererFetcher {
   }
 
   /**
-   * 创建代码渲染器
+   * 创建代码渲染器（CodeBlockCard）
    */
   private _createCodeRenderer(): RendererCode {
     return {
@@ -510,7 +795,7 @@ export class RendererFetcher {
   }
 
   /**
-   * 创建 Markdown 渲染器
+   * 创建 Markdown 渲染器（MarkdownCard）
    */
   private _createMarkdownRenderer(): RendererCode {
     return {

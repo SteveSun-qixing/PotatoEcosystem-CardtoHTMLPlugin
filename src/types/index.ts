@@ -4,6 +4,11 @@
  * 定义插件使用的所有数据结构和接口类型
  */
 
+import type {
+  ConversionAppearanceProfile,
+  DeepPartial,
+} from '../appearance';
+
 // ============================================================================
 // 卡片数据结构
 // ============================================================================
@@ -158,6 +163,10 @@ export interface ConversionOptions {
   parallelCount?: number;
   /** 进度回调 */
   onProgress?: (progress: ProgressInfo) => void;
+  /** 外观配置表 ID（由转换模块统一管理） */
+  appearanceProfileId?: string;
+  /** 外观参数覆盖（用于后续扩展自定义外观） */
+  appearanceOverrides?: DeepPartial<Omit<ConversionAppearanceProfile, 'id' | 'description'>>;
 }
 
 /**

@@ -150,14 +150,20 @@ export class ResourceHandler {
     }
 
     // 获取资源内容
-    const content = rawFiles?.get(resource.originalPath);
+    let content = rawFiles?.get(resource.originalPath);
     if (!content) {
       // 尝试不同的路径格式
       const altPath = resource.originalPath.startsWith('./')
         ? resource.originalPath.slice(2)
         : `./${resource.originalPath}`;
-      const altContent = rawFiles?.get(altPath);
-      if (!altContent) {
+      content = rawFiles?.get(altPath);
+
+      // 尝试从 content/ 子目录查找（向后兼容）
+      if (!content) {
+        content = rawFiles?.get(`content/${resource.originalPath}`);
+      }
+
+      if (!content) {
         return null;
       }
     }
@@ -170,13 +176,18 @@ export class ResourceHandler {
     return {
       originalPath: resource.originalPath,
       outputPath,
-      content: content!,
+      content,
       type: resource.type,
     };
   }
 
   /**
    * 更新 HTML 中的资源引用
+   *
+   * 支持三种引用格式的替换：
+   * 1. HTML 属性：src="path" / href="path"
+   * 2. CSS 引用：url("path")
+   * 3. JSON 配置：嵌入在 <script> 标签中的 JSON 字符串值（如 "file_path": "photo.jpg"）
    *
    * @param htmlFiles - HTML 文件映射
    * @param resources - 处理后的资源列表
@@ -210,7 +221,7 @@ export class ResourceHandler {
 
       // 替换所有资源引用
       for (const [original, output] of pathMap) {
-        // 替换各种可能的引用格式
+        // 替换 HTML 属性和 CSS 引用
         const patterns = [
           new RegExp(`src=["']${this._escapeRegex(original)}["']`, 'g'),
           new RegExp(`href=["']${this._escapeRegex(original)}["']`, 'g'),
@@ -226,6 +237,28 @@ export class ResourceHandler {
 
           updated = updated.replace(pattern, replacement);
         }
+
+        // 替换 JSON 配置中的路径引用
+        // 匹配 JSON 字符串值中的资源路径（如 "file_path": "photo.jpg"）
+        // 需要处理 JSON 转义的引号
+        const jsonEscapedOriginal = original.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        const jsonEscapedOutput = `${relativePath}${output}`.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+        // 替换 JSON 中 "key": "originalPath" 格式的值
+        const jsonPattern = new RegExp(
+          `"${this._escapeRegex(jsonEscapedOriginal)}"`,
+          'g'
+        );
+        updated = updated.replace(jsonPattern, `"${jsonEscapedOutput}"`);
+
+        // 替换 HTML 转义内容（例如内联 JSON/HTML 片段中的 &quot;path&quot;）
+        const htmlEscapedOriginal = this._escapeHTML(original);
+        const htmlEscapedOutput = this._escapeHTML(`${relativePath}${output}`);
+        const htmlEscapedPattern = new RegExp(
+          `&quot;${this._escapeRegex(htmlEscapedOriginal)}&quot;`,
+          'g'
+        );
+        updated = updated.replace(htmlEscapedPattern, `&quot;${htmlEscapedOutput}&quot;`);
       }
 
       updatedFiles.set(path, updated);
@@ -250,6 +283,18 @@ export class ResourceHandler {
    */
   private _escapeRegex(str: string): string {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /**
+   * HTML 转义
+   */
+  private _escapeHTML(str: string): string {
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
   }
 }
 

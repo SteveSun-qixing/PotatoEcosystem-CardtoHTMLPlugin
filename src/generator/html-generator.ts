@@ -11,6 +11,8 @@ import type {
   RendererCodeMap,
   HTMLFileMap,
 } from '../types';
+import type { ConversionAppearanceProfile } from '../appearance';
+import { resolveConversionAppearance } from '../appearance';
 
 /**
  * HTMLGenerator 配置选项
@@ -45,6 +47,21 @@ export interface GenerateResult {
 }
 
 /**
+ * 直出 DOM 渲染模型（用于 index.html）
+ */
+interface InlineCardBundle {
+  id: string;
+  type: string;
+  typeLabel: string;
+  config: Record<string, unknown>;
+  bodyHTML: string;
+  inlineStyles: string[];
+  externalStyles: string[];
+  externalScripts: string[];
+  inlineScripts: string[];
+}
+
+/**
  * HTML 生成器
  */
 export class HTMLGenerator {
@@ -66,9 +83,15 @@ export class HTMLGenerator {
    * @param renderers - 渲染代码映射
    * @returns 生成结果
    */
-  async generate(cardData: CardData, renderers: RendererCodeMap): Promise<GenerateResult> {
+  async generate(
+    cardData: CardData,
+    renderers: RendererCodeMap,
+    appearance?: ConversionAppearanceProfile
+  ): Promise<GenerateResult> {
     const files: HTMLFileMap = new Map();
     const warnings: string[] = [];
+    const inlineCardBundles: InlineCardBundle[] = [];
+    const resolvedAppearance = appearance ?? resolveConversionAppearance();
 
     try {
       // 1. 为每个基础卡片生成 HTML
@@ -81,10 +104,11 @@ export class HTMLGenerator {
 
         const html = this._generateBaseCardHTML(baseCard, renderer);
         files.set(`cards/${baseCard.id}.html`, html);
+        inlineCardBundles.push(this._buildInlineCardBundle(baseCard, html));
       }
 
       // 2. 生成主入口页面
-      const indexHTML = this._generateIndexHTML(cardData, cardData.baseCards.map(c => c.id));
+      const indexHTML = this._generateIndexHTML(cardData, inlineCardBundles, resolvedAppearance);
       files.set('index.html', indexHTML);
 
       return {
@@ -143,29 +167,34 @@ export class HTMLGenerator {
   /**
    * 生成主入口页面
    *
+   * 采用「无 iframe 纯直出 DOM」架构：
+   * - 所有基础卡片内容直接挂载到 index.html
+   * - 每个基础卡片使用 Shadow DOM 作为样式/脚本隔离容器
+   * - 导出页面在 file:// 场景下可独立打开，无需薯片运行时环境
+   *
    * @param cardData - 卡片数据
-   * @param baseCardIds - 基础卡片 ID 列表
+   * @param inlineCardBundles - 基础卡片直出数据
+   * @param appearance - 统一外观配置
    * @returns HTML 字符串
    */
-  private _generateIndexHTML(cardData: CardData, _baseCardIds: string[]): string {
+  private _generateIndexHTML(
+    cardData: CardData,
+    inlineCardBundles: InlineCardBundle[],
+    appearance: ConversionAppearanceProfile
+  ): string {
     const { metadata } = cardData;
+    const { layout } = appearance;
     const tags = (metadata.tags ?? []) as unknown[];
-    const createdAt = metadata.createdAt
-      ? new Date(metadata.createdAt).toLocaleString('zh-CN')
-      : '未知';
-    const exportAt = new Date().toLocaleString('zh-CN');
-    const baseCards = cardData.baseCards ?? [];
+    const bundleJSON = this._serializeForInlineScript(inlineCardBundles);
 
-    const baseCardContent = baseCards.length > 0
-      ? baseCards.map((baseCard) => {
-        const typeLabel = this._getBaseCardTypeName(baseCard.type);
-        const contentHTML = this._renderBaseCardContent(baseCard);
+    // 为每个基础卡片生成挂载容器
+    const cardContent = inlineCardBundles.length > 0
+      ? inlineCardBundles.map((bundle) => {
         return `
-        <div class="base-card">
-          <span class="base-card-type">${this._escapeHTML(typeLabel)}</span>
-          <div class="base-card-content">${contentHTML}</div>
-        </div>`;
-      }).join('')
+        <section class="base-card-wrapper" data-card-id="${this._escapeHTML(bundle.id)}" data-card-type="${this._escapeHTML(bundle.type)}" aria-label="${this._escapeHTML(bundle.typeLabel)}">
+          <div class="base-card-host"></div>
+        </section>`;
+      }).join('\n')
       : '<p class="empty-state">此卡片暂无内容</p>';
 
     const tagHTML = tags.length > 0
@@ -184,86 +213,72 @@ export class HTMLGenerator {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="generator" content="Chips CardtoHTML Plugin">
-  <meta name="created-at" content="${this._escapeHTML(metadata.createdAt)}">
-  <meta name="modified-at" content="${this._escapeHTML(metadata.modifiedAt)}">
   <title>${this._escapeHTML(metadata.name)}</title>
   <link rel="stylesheet" href="theme.css">
   <style>
+    :root {
+      --chips-page-bg: ${this._escapeHTML(layout.pageBackgroundColor)};
+      --chips-card-width: ${layout.cardWidthPx}px;
+      --chips-page-padding-x: ${layout.pagePaddingXpx}px;
+      --chips-page-padding-y: ${layout.pagePaddingYpx}px;
+      --chips-page-padding-bottom-extra: ${layout.pagePaddingBottomExtraPx}px;
+    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { min-height: 100%; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
       line-height: 1.8;
       color: #333;
-      background: #f5f5f5;
-      padding: 40px;
+      background: var(--chips-page-bg);
+      padding: var(--chips-page-padding-y) var(--chips-page-padding-x) calc(var(--chips-page-padding-y) + var(--chips-page-padding-bottom-extra));
     }
-    .container {
-      max-width: 800px;
+    .card-container {
+      width: 100%;
+      max-width: var(--chips-card-width);
       margin: 0 auto;
       background: #fff;
       border-radius: 16px;
       box-shadow: 0 4px 24px rgba(0,0,0,0.08);
-      padding: 48px;
+      overflow: hidden;
     }
-    h1 {
+    .card-header {
+      padding: 32px 48px 24px;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    .card-header h1 {
       color: #1a1a1a;
-      font-size: 32px;
+      font-size: 28px;
       font-weight: 700;
-      margin-bottom: 16px;
-      border-bottom: 3px solid #3b82f6;
-      padding-bottom: 16px;
+      margin-bottom: 0;
     }
-    .meta {
-      color: #666;
-      font-size: 14px;
-      margin-bottom: 32px;
-      padding: 16px;
-      background: #f8fafc;
-      border-radius: 8px;
+    .card-body {
+      display: flex;
+      flex-direction: column;
     }
-    .meta p { margin: 6px 0; }
-    .meta strong { color: #333; }
-    .content { margin-top: 24px; }
-    .content h2 {
-      font-size: 20px;
-      color: #1a1a1a;
-      margin: 24px 0 16px;
-      padding-left: 12px;
-      border-left: 4px solid #3b82f6;
+    .base-card-wrapper {
+      width: 100%;
+      position: relative;
+      overflow: visible;
+      border-bottom: 1px solid #f0f2f5;
+      padding: 20px 24px;
     }
-    .base-card {
-      background: #fafafa;
-      border: 1px solid #e5e7eb;
-      border-radius: 8px;
-      padding: 16px;
-      margin: 12px 0;
+    .base-card-wrapper:last-child {
+      border-bottom: none;
     }
-    .base-card-type {
-      display: inline-block;
-      background: #e0f2fe;
-      color: #0369a1;
-      padding: 2px 10px;
-      border-radius: 12px;
-      font-size: 12px;
-      font-weight: 500;
-      margin-bottom: 8px;
-    }
-    .base-card-content {
-      color: #374151;
-      font-size: 15px;
-    }
-    .base-card-content img {
-      max-width: 100%;
-      height: auto;
+    .base-card-host {
+      width: 100%;
+      display: block;
+      min-height: 48px;
+      background: transparent;
     }
     .empty-state {
       color: #999;
       text-align: center;
-      padding: 40px 0;
+      padding: 60px 0;
+      font-size: 15px;
     }
     .tags {
-      margin-top: 32px;
-      padding-top: 24px;
+      padding: 16px 48px 24px;
       border-top: 1px solid #e5e7eb;
     }
     .tag {
@@ -275,33 +290,214 @@ export class HTMLGenerator {
       font-size: 13px;
       margin: 4px 4px 4px 0;
     }
-    .footer {
-      margin-top: 40px;
-      padding-top: 24px;
-      border-top: 1px solid #e5e7eb;
-      color: #9ca3af;
-      font-size: 12px;
-      text-align: center;
+    @media (max-width: 768px) {
+      :root {
+        --chips-page-padding-x: ${layout.mobilePaddingXpx}px;
+        --chips-page-padding-y: ${layout.mobilePaddingYpx}px;
+      }
+      .card-header {
+        padding: 22px 20px 16px;
+      }
+      .base-card-wrapper {
+        padding: 14px 12px;
+      }
+      .tags {
+        padding: 12px 20px 14px;
+      }
+    }
+    @media print {
+      html, body {
+        background: var(--chips-page-bg) !important;
+      }
+      * {
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <h1>${this._escapeHTML(metadata.name)}</h1>
-    <div class="meta">
-      <p><strong>卡片 ID:</strong> ${this._escapeHTML(metadata.id)}</p>
-      <p><strong>创建时间:</strong> ${this._escapeHTML(createdAt)}</p>
-      <p><strong>导出时间:</strong> ${this._escapeHTML(exportAt)}</p>
+  <div class="card-container">
+    <div class="card-header">
+      <h1>${this._escapeHTML(metadata.name)}</h1>
     </div>
-    <div class="content">
-      <h2>卡片内容</h2>
-      ${baseCardContent}
+    <div class="card-body">
+      ${cardContent}
     </div>
     ${tagHTML}
-    <div class="footer">
-      由 Chips Editor 导出 · ${new Date().toLocaleDateString('zh-CN')}
-    </div>
   </div>
+
+  <script>
+    (function() {
+      var bundles = ${bundleJSON};
+
+      function createScopedDocument(scopeRoot) {
+        var owner = scopeRoot.ownerDocument || document;
+
+        function findById(id) {
+          if (!id) return null;
+          var list = scopeRoot.querySelectorAll('[id]');
+          for (var i = 0; i < list.length; i++) {
+            if (list[i].id === id) {
+              return list[i];
+            }
+          }
+          return null;
+        }
+
+        return {
+          getElementById: findById,
+          querySelector: function(selector) {
+            return scopeRoot.querySelector(selector);
+          },
+          querySelectorAll: function(selector) {
+            return scopeRoot.querySelectorAll(selector);
+          },
+          getElementsByClassName: function(className) {
+            return scopeRoot.getElementsByClassName(className);
+          },
+          getElementsByTagName: function(tagName) {
+            return scopeRoot.getElementsByTagName(tagName);
+          },
+          createElement: function(tagName) {
+            return owner.createElement(tagName);
+          },
+          createElementNS: function(namespaceURI, qualifiedName) {
+            return owner.createElementNS(namespaceURI, qualifiedName);
+          },
+          createTextNode: function(text) {
+            return owner.createTextNode(text);
+          },
+          createDocumentFragment: function() {
+            return owner.createDocumentFragment();
+          },
+          addEventListener: function(type, listener, options) {
+            scopeRoot.addEventListener(type, listener, options);
+          },
+          removeEventListener: function(type, listener, options) {
+            scopeRoot.removeEventListener(type, listener, options);
+          },
+          body: scopeRoot,
+          head: scopeRoot,
+          documentElement: scopeRoot,
+          defaultView: window,
+          readyState: 'complete',
+        };
+      }
+
+      function runInlineScript(sourceCode, scopedWindow, scopedDocument, cardId) {
+        if (!sourceCode || !sourceCode.trim()) return;
+        try {
+          var runner = new Function('window', 'document', sourceCode + '\\n//# sourceURL=chips-inline-card-' + String(cardId || 'unknown'));
+          runner.call(scopedWindow, scopedWindow, scopedDocument);
+        } catch (e) {
+          console.error('[Chips Export] 基础卡片脚本执行失败:', cardId, e);
+        }
+      }
+
+      function mountBundle(wrapper, bundle) {
+        var host = wrapper.querySelector('.base-card-host');
+        if (!host || !bundle) return;
+
+        var owner = host.ownerDocument || document;
+        var mountRoot = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host;
+
+        if (mountRoot.innerHTML !== undefined) {
+          mountRoot.innerHTML = '';
+        }
+
+        if (host.attachShadow) {
+          var resetStyle = owner.createElement('style');
+          resetStyle.textContent = ':host{display:block;width:100%;contain:content;} .chips-inline-card-shell{width:100%;display:block;}';
+          mountRoot.appendChild(resetStyle);
+        }
+
+        if (Array.isArray(bundle.externalStyles)) {
+          for (var i = 0; i < bundle.externalStyles.length; i++) {
+            var href = bundle.externalStyles[i];
+            if (!href) continue;
+            var linkEl = owner.createElement('link');
+            linkEl.rel = 'stylesheet';
+            linkEl.href = href;
+            mountRoot.appendChild(linkEl);
+          }
+        }
+
+        if (Array.isArray(bundle.inlineStyles)) {
+          for (var j = 0; j < bundle.inlineStyles.length; j++) {
+            var cssText = bundle.inlineStyles[j];
+            if (!cssText) continue;
+            var styleEl = owner.createElement('style');
+            styleEl.textContent = cssText;
+            mountRoot.appendChild(styleEl);
+          }
+        }
+
+        var scopeRoot = owner.createElement('div');
+        scopeRoot.className = 'chips-inline-card-shell';
+        scopeRoot.innerHTML = bundle.bodyHTML || '';
+        mountRoot.appendChild(scopeRoot);
+
+        var scopedDocument = createScopedDocument(scopeRoot);
+        var scopedWindow = {
+          CHIPS_CARD_CONFIG: bundle.config || {},
+          document: scopedDocument,
+          console: window.console,
+          setTimeout: window.setTimeout.bind(window),
+          clearTimeout: window.clearTimeout.bind(window),
+          requestAnimationFrame: window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : null,
+          cancelAnimationFrame: window.cancelAnimationFrame ? window.cancelAnimationFrame.bind(window) : null,
+        };
+        scopedWindow.window = scopedWindow;
+        scopedWindow.self = scopedWindow;
+        scopedWindow.globalThis = scopedWindow;
+
+        function executeInlineScripts() {
+          var scripts = Array.isArray(bundle.inlineScripts) ? bundle.inlineScripts : [];
+          for (var k = 0; k < scripts.length; k++) {
+            runInlineScript(scripts[k], scopedWindow, scopedDocument, bundle.id);
+          }
+        }
+
+        function loadExternalScriptsSequentially(sources, done, index) {
+          if (index >= sources.length) {
+            done();
+            return;
+          }
+
+          var src = sources[index];
+          if (!src) {
+            loadExternalScriptsSequentially(sources, done, index + 1);
+            return;
+          }
+
+          var scriptEl = owner.createElement('script');
+          scriptEl.src = src;
+          scriptEl.async = false;
+          scriptEl.onload = function() {
+            loadExternalScriptsSequentially(sources, done, index + 1);
+          };
+          scriptEl.onerror = function() {
+            console.error('[Chips Export] 外链脚本加载失败:', src);
+            loadExternalScriptsSequentially(sources, done, index + 1);
+          };
+          owner.head.appendChild(scriptEl);
+        }
+
+        var externalScripts = Array.isArray(bundle.externalScripts) ? bundle.externalScripts : [];
+        if (externalScripts.length > 0) {
+          loadExternalScriptsSequentially(externalScripts, executeInlineScripts, 0);
+        } else {
+          executeInlineScripts();
+        }
+      }
+
+      var wrappers = document.querySelectorAll('.base-card-wrapper');
+      for (var idx = 0; idx < wrappers.length; idx++) {
+        mountBundle(wrappers[idx], bundles[idx]);
+      }
+    })();
+  </script>
 </body>
 </html>`;
 
@@ -309,36 +505,216 @@ export class HTMLGenerator {
   }
 
   /**
-   * 获取基础卡片类型名称
+   * 获取基础卡片类型的中文名称
+   *
+   * 类型名统一使用 PascalCase（卡片文件格式规范标准）
    */
   private _getBaseCardTypeName(type: string): string {
     const typeNames: Record<string, string> = {
-      'rich-text': '富文本',
-      'markdown': 'Markdown',
-      'image': '图片',
-      'video': '视频',
-      'audio': '音频',
-      'code': '代码',
-      'list': '列表',
+      'RichTextCard': '富文本',
+      'MarkdownCard': 'Markdown',
+      'ImageCard': '图片',
+      'VideoCard': '视频',
+      'AudioCard': '音频',
+      'CodeBlockCard': '代码',
+      'ListCard': '列表',
     };
     return typeNames[type] || type;
   }
 
   /**
-   * 渲染基础卡片内容
+   * 构建基础卡片直出 DOM 数据
    */
-  private _renderBaseCardContent(baseCard: BaseCardConfig): string {
-    const config = baseCard.config ?? {};
-    const content = (config as Record<string, unknown>).content_text
-      ?? (config as Record<string, unknown>).content
-      ?? (config as Record<string, unknown>).text
-      ?? '';
+  private _buildInlineCardBundle(baseCard: BaseCardConfig, cardHTML: string): InlineCardBundle {
+    const inlineStyles = this._extractInlineStyleBlocks(cardHTML).map((css) => this._scopeCardStyle(css));
+    const externalStyles = Array.from(new Set(
+      this._extractExternalStyles(cardHTML)
+        .map((href) => this._normalizeRelativePath(href))
+        .filter((href) => href.length > 0 && !this._isThemeStylesheet(href))
+    ));
+    const externalScripts = Array.from(new Set(
+      this._extractExternalScripts(cardHTML)
+        .map((src) => this._normalizeRelativePath(src))
+        .filter((src) => src.length > 0)
+    ));
+    const inlineScripts = this._extractInlineScripts(cardHTML).filter((code) => !this._isConfigScript(code));
+    const bodyHTML = this._stripScriptTags(this._extractBodyHTML(cardHTML));
 
-    if (typeof content === 'string' && content.trim().length > 0) {
-      return content;
+    return {
+      id: baseCard.id,
+      type: baseCard.type,
+      typeLabel: this._getBaseCardTypeName(baseCard.type),
+      config: baseCard.config ?? {},
+      bodyHTML,
+      inlineStyles,
+      externalStyles,
+      externalScripts,
+      inlineScripts,
+    };
+  }
+
+  /**
+   * 提取 <body> 内部 HTML
+   */
+  private _extractBodyHTML(html: string): string {
+    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+    return bodyMatch?.[1] ?? html;
+  }
+
+  /**
+   * 提取内联样式块
+   */
+  private _extractInlineStyleBlocks(html: string): string[] {
+    const styles: string[] = [];
+    const styleRegex = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+
+    let match = styleRegex.exec(html);
+    while (match) {
+      styles.push(match[1] ?? '');
+      match = styleRegex.exec(html);
     }
 
-    return '<em style="color:#999">暂无内容</em>';
+    return styles;
+  }
+
+  /**
+   * 提取外部样式链接（link rel="stylesheet"）
+   */
+  private _extractExternalStyles(html: string): string[] {
+    const links: string[] = [];
+    const linkRegex = /<link\b([^>]+)>/gi;
+
+    let match = linkRegex.exec(html);
+    while (match) {
+      const attrs = match[1] ?? '';
+      if (!/rel\s*=\s*["']?stylesheet["']?/i.test(attrs)) {
+        match = linkRegex.exec(html);
+        continue;
+      }
+
+      let hrefMatch = attrs.match(/href\s*=\s*["']([^"']+)["']/i);
+      if (!hrefMatch) {
+        hrefMatch = attrs.match(/href\s*=\s*([^\s"'=<>`]+)/i);
+      }
+
+      if (hrefMatch?.[1]) {
+        links.push(hrefMatch[1]);
+      }
+
+      match = linkRegex.exec(html);
+    }
+
+    return links;
+  }
+
+  /**
+   * 提取外链脚本（script src="..."）
+   */
+  private _extractExternalScripts(html: string): string[] {
+    const scripts: string[] = [];
+    const scriptRegex = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+
+    let match = scriptRegex.exec(html);
+    while (match) {
+      const attrs = match[1] ?? '';
+      let srcMatch = attrs.match(/src\s*=\s*["']([^"']+)["']/i);
+      if (!srcMatch) {
+        srcMatch = attrs.match(/src\s*=\s*([^\s"'=<>`]+)/i);
+      }
+
+      if (srcMatch?.[1]) {
+        scripts.push(srcMatch[1]);
+      }
+
+      match = scriptRegex.exec(html);
+    }
+
+    return scripts;
+  }
+
+  /**
+   * 提取内联脚本（不包含 src 外链脚本）
+   */
+  private _extractInlineScripts(html: string): string[] {
+    const scripts: string[] = [];
+    const scriptRegex = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+
+    let match = scriptRegex.exec(html);
+    while (match) {
+      const attrs = match[1] ?? '';
+      if (/src\s*=/i.test(attrs)) {
+        match = scriptRegex.exec(html);
+        continue;
+      }
+
+      const code = match[2] ?? '';
+      if (code.trim().length > 0) {
+        scripts.push(code);
+      }
+
+      match = scriptRegex.exec(html);
+    }
+
+    return scripts;
+  }
+
+  /**
+   * 删除 HTML 中的脚本标签，避免重复执行
+   */
+  private _stripScriptTags(html: string): string {
+    return html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+  }
+
+  /**
+   * 判断脚本是否为配置注入脚本
+   */
+  private _isConfigScript(code: string): boolean {
+    return /window\.CHIPS_CARD_CONFIG\s*=/.test(code);
+  }
+
+  /**
+   * 判断是否为主题样式文件
+   */
+  private _isThemeStylesheet(href: string): boolean {
+    const normalized = href.replace(/^[./]+/, '');
+    return normalized === 'theme.css' || normalized.endsWith('/theme.css');
+  }
+
+  /**
+   * 将相对路径归一到 index.html 相对路径
+   */
+  private _normalizeRelativePath(path: string): string {
+    let normalized = path.trim();
+    while (normalized.startsWith('../')) {
+      normalized = normalized.slice(3);
+    }
+    if (normalized.startsWith('./')) {
+      normalized = normalized.slice(2);
+    }
+    return normalized;
+  }
+
+  /**
+   * 将基础卡片样式从页面级选择器转换为 Shadow DOM 作用域
+   */
+  private _scopeCardStyle(css: string): string {
+    return css
+      .replace(/:root/g, ':host')
+      .replace(/\bhtml\b/g, ':host')
+      .replace(/\bbody\b/g, ':host');
+  }
+
+  /**
+   * 将数据序列化为可安全内联到 <script> 的 JSON
+   */
+  private _serializeForInlineScript(value: unknown): string {
+    const json = JSON.stringify(value) ?? 'null';
+    return json
+      .replace(/</g, '\\u003C')
+      .replace(/>/g, '\\u003E')
+      .replace(/&/g, '\\u0026')
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029');
   }
 
   /**
